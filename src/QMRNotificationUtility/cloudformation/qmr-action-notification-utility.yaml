@@ -1,0 +1,191 @@
+---
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Creates SNS topic , IAM Lambda Role , Lambda Function and Scheduled Event to run lambda function.
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+    - Label:
+        default: SNS
+      Parameters:
+      - SNSEmailParameter
+    - Label:
+        default: Network Configuration for Lambda Function
+      Parameters:
+      - VPC
+      - SubnetIds
+      - SecurityGroupIds
+    - Label:
+        default: S3 Bucket and Key in which the Lambda Function Deployment Package(.zip file) is located
+      Parameters:
+      - S3Bucket
+      - S3Key
+    - Label:
+        default: Redshift cluster Configuration
+      Parameters:
+      - RedshiftMonitoringUser
+      - RedshiftClusterPort
+      - RedshiftClusterIdentifier
+      - RedshiftClusterDatabase
+      - RedshiftClusterRegion
+Parameters:
+  SNSEmailParameter:
+    Type: String
+    Default: test@email.com
+    Description: Enter EmailId to subscribe to SNS topic
+  VPC:
+    Description: VPC in which the Redshift cluster is available.
+    Type: AWS::EC2::VPC::Id
+  SubnetIds:
+    Description: Select private subnet(s) for your Lambda function.
+    Type: List<AWS::EC2::Subnet::Id>
+  SecurityGroupIds:
+    Description: Select a security group for your Lambda function.
+    Type: AWS::EC2::SecurityGroup::Id
+  S3Bucket:
+    Description: S3 Bucket in which the Lambda Function Deployment Package(.zip file) is located.
+    Type: String
+  S3Key:
+    Description: String of S3 path to the Lambda Function Deployment Package(.zip file).
+    Type: String
+  RedshiftClusterPort:
+    Description: Port of Amazon Redshift cluster to attempt connection from Lambda on.
+    Type: Number
+  RedshiftClusterIdentifier:
+    Description: Amazon Redshift cluster endpoint to attempt connection from Lambda on.
+    Type: String
+  RedshiftClusterDatabase: 
+    Description: Amazon Redshift cluster database to attempt connection from Lambda on.
+    Type: String
+  RedshiftMonitoringUser:
+    Description: Username of Amazon Redshift monitoring user to poll STL_WLM_QUERY_ACTIONS as.
+    Type: String
+  RedshiftClusterRegion:
+    Description: The AWS Region where the Redshift cluster is deployed.
+    Type: String
+
+Resources:
+
+  LambdaSNSTopic:
+    Type: "AWS::SNS::Topic"
+    Properties:
+      TopicName:
+          Fn::Sub: "${AWS::StackName}-RedshiftLambdaTopic"
+
+  MySubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      Endpoint: !Ref 'SNSEmailParameter'
+      Protocol: email
+      TopicArn: !Ref 'LambdaSNSTopic'
+
+  LambdaRedshiftRole:
+    Type: AWS::IAM::Role
+    DependsOn: LambdaSNSTopic
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service: lambda.amazonaws.com
+          Action: sts:AssumeRole
+      Policies:
+      - PolicyName:
+          Fn::Sub: "${AWS::StackName}-LambdaRedshiftRolePolicy"
+        PolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+              # logs: Needed by the Lambda
+            - Effect: Allow
+              Resource: !Ref 'LambdaSNSTopic'
+              Action:
+              - sns:Publish
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole
+        - arn:aws:iam::aws:policy/AmazonRedshiftDataFullAccess
+        - arn:aws:iam::aws:policy/AmazonRedshiftQueryEditor
+        - arn:aws:iam::aws:policy/AmazonSNSFullAccess
+      Path: "/"
+
+  RedshiftQMRLambdaFunction:
+    Type: AWS::Lambda::Function
+    Description: 'Lambda function to enable QMR notifications'
+    DependsOn: LambdaSNSTopic
+    DependsOn: LambdaRedshiftRole
+    Properties:
+      Handler: lambda_function.lambda_handler
+      Role:
+        Fn::GetAtt:
+          - "LambdaRedshiftRole"
+          - "Arn"
+      VpcConfig:
+        SecurityGroupIds:
+          - Ref: SecurityGroupIds
+        SubnetIds: !Ref 'SubnetIds'
+
+      Code:
+        S3Bucket: !Ref 'S3Bucket'
+        S3Key: !Ref 'S3Key'
+
+      Runtime: python3.9
+      Timeout: '300'
+      FunctionName:
+        Fn::Sub: "${AWS::StackName}-RedshiftQMRLambda"
+      Environment:
+        Variables:
+          sns_arn: !Ref 'LambdaSNSTopic'
+          host: !Ref 'RedshiftClusterIdentifier'
+          port: !Ref 'RedshiftClusterPort'
+          database: !Ref 'RedshiftClusterDatabase'
+          user: !Ref 'RedshiftMonitoringUser'
+
+  ScheduledRule:
+    Type: "AWS::Events::Rule"
+    DependsOn: RedshiftQMRLambdaFunction
+    Properties:
+      Description: "Scheduled Rule to run Redshift QMR lambda function"
+      ScheduleExpression: "rate(5 minutes)"
+      State: "ENABLED"
+      Targets:
+        -
+          Arn:
+            Fn::GetAtt:
+              - "RedshiftQMRLambdaFunction"
+              - "Arn"
+          Id: "TargetRedshiftQMRLambdaFunctionV1"
+
+  PermissionForEventsToInvokeLambda:
+    Type: "AWS::Lambda::Permission"
+    DependsOn: RedshiftQMRLambdaFunction
+    Properties:
+      FunctionName:
+        Ref: "RedshiftQMRLambdaFunction"
+      Action: "lambda:InvokeFunction"
+      Principal: "events.amazonaws.com"
+      SourceArn:
+        Fn::GetAtt:
+          - "ScheduledRule"
+          - "Arn"
+
+Outputs:
+
+  LambdaSNSTopicArn:
+    Description: 'SNS Topic Arn'
+    Value:
+        !Ref 'LambdaSNSTopic'
+
+  LambdaRedshiftRoleArn:
+    Description: 'Lambda Redshift Role Arn'
+    Value:
+        !Ref 'LambdaRedshiftRole'
+
+  RedshiftQMRLambdaArn:
+    Description: 'Lambda Redshift QMR Arn'
+    Value:
+        !Ref 'RedshiftQMRLambdaFunction'
+
+  LambdaRedshiftScheduleArn:
+    Description: 'Lambda Redshift Scheduled Rule Arn'
+    Value:
+        !Ref 'ScheduledRule'
+
